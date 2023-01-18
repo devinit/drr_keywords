@@ -1,65 +1,32 @@
-required.packages <- c("data.table", "rstudioapi", "rvest")
-lapply(required.packages, require, character.only = T)
+lapply(c("data.table", "rstudioapi"), require, character.only = T)
+setwd(dirname(getActiveDocumentContext()$path))
 
-setwd(dirname(dirname(getActiveDocumentContext()$path)))
+#Establish donors types
+donors <- rbindlist(lapply(xmlToList(htmlParse(GET("https://stats.oecd.org/restsdmx/sdmx.ashx/GetDataStructure/TABLE2A")))$body$structure$codelists[[2]], function(x) data.frame(cbind(as.data.table(x)[1, ], as.data.table(x)[2, ]))), fill = T)
+donors <- setnames(rbind(
+  data.table("DAC donor", unlist(donors[.attrs.1 %in% 20001]$.attrs)),
+  data.table("Non-DAC donor", c(unlist(donors[.attrs.1 %in% 20006]$.attrs), 87)),
+  data.table("Multilateral donor", c(unlist(donors[.attrs.1 %in% c(20002, 20007:20034)]$.attrs), 1015)),
+  data.table("Private donor", unlist(donors[.attrs.1 %in% c(20035, 21600)]$.attrs))), c("DonorType", "DonorCode"))
 
-load_crs <- function(dataname="crs", path="project_data"){
-  require("data.table")
-  files.bz <- list.files(path, pattern=paste0(dataname, "_part.+[.]bz"))
-  files.csv <- list.files(path, pattern=paste0(dataname, "_part.+[.]csv"))
-  if(length(files.bz) > 0 & length(files.csv) > 0){
-    files <- files.csv
-    read.crs <- function(x){return(fread(x))}
-  } else {
-    if(length(files.bz) > 0){
-      files <- files.bz
-      read.crs <- function(x){return(read.csv(x))}
-    } else {
-      files <- files.csv
-      read.crs <- function(x){return(fread(x))}
-    }
-  }
-  crs <- list()
-  for(i in 1:length(files)){
-    print(paste0("Loading part ", i, " of ", length(files)))
-    filepath <- paste0(path, "/", files[i])
-    crs[[i]] <- read.crs(filepath)
-  }
-  crs <- rbindlist(crs)
-  return(crs)
+years <- 2016:2021
+
+crs_list <- list()
+for(i in 1:length(years)){
+  
+  year <- years[[i]]
+  crs_list[[i]] <- fread(paste0("https://github.com/devinit/gha_automation/raw/main/IHA/datasets/crs_", year, ".gz"), showProgress = F)
+  message(years[[i]])
 }
+crs_raw <- rbindlist(crs_list)
+rm(crs_list)
 
-crs <- load_crs(path = "project_data")
+oecd_isos <- fread("ISOs/oecd_isos.csv", encoding = "UTF-8")
+population <- fread("Population/population.csv", encoding = "UTF-8")
 
-keep <- c(
-  "CrsID",
-  "Year",
-  "FlowName",
-  "DonorName",
-  "RecipientName",
-  "USD_Disbursement_Defl",
-  "PurposeName",
-  "ProjectTitle",
-  "ShortDescription",
-  "LongDescription",
-  "DRR"
-)
+population <- population[Time %in% years & Variant == "Medium" & LocID < 900]
 
-crs <- crs[, ..keep]
-
-crs <- crs[
-  FlowName == "ODA Loans" 
-  |
-    FlowName == "ODA Grants"
-  | 
-    FlowName == "Equity Investment"
-  | 
-    FlowName == "Private Development Finance"
-  ]
-
-crs <- crs[Year >= 2019]
-
-major.keywords <- c(
+major_keywords <- c(
   "anti-seismic adaption",
   "cbdrm",
   "climate protection",
@@ -146,54 +113,86 @@ major.keywords <- c(
   "sendai framework"
 )
 
-#minor.keywords <- c(
-  #"keyword"
- #)
-
-disqualifying.keywords <- c(
-"serendipity",
-"domestic revenue mobilisation"
+disqualifying_keywords <- c(
+  "serendipity",
+  "domestic revenue mobilisation"
 )
 
-disqualifying.sectors <- c(
+disqualifying_sectors <- c(
   "Domestic revenue mobilisation"
 )
 
+crs <- crs_raw[
+  FlowName == "ODA Loans" 
+  |
+    FlowName == "ODA Grants"
+  | 
+    FlowName == "Equity Investment"
+  | 
+    FlowName == "Private Development Finance"
+]
+
+crs <- merge(crs, oecd_isos[, .(RecipientName = countryname_oecd, RecipientISO = iso3)], by = "RecipientName", all.x = T)
+crs <- merge(crs, oecd_isos[, .(DonorName = countryname_oecd, DonorISO = iso3)], by = "DonorName", all.x = T)
+crs <- merge(crs, donors[, .(DonorType, DonorCode = as.integer(DonorCode))], by = "DonorCode", all.x = T)
+
+#COVID identifier
+covid_keywords <- c(
+  "covid",
+  "coronavirus",
+  "covax",
+  "corona",
+  "\\bc19\\b"
+)
+
+crs[grepl(paste(covid_keywords, collapse = "|"), tolower(paste(LongDescription, ShortDescription, ProjectTitle))) | PurposeName == "COVID-19 control", Covid_relevance := "COVID"]
+
 #Assign relevance based on keywords
 crs[, relevance := "None"]
-crs[grepl(paste(major.keywords, collapse = "|"), tolower(crs$LongDescription)), relevance := "Minor"]
-crs[grepl(paste(major.keywords, collapse = "|"), tolower(paste(crs$ShortDescription, crs$ProjectTitle))), relevance := "Major"]
-
-#Create check column based on disqualifying factors
-crs[, check := "No"]
-#crs[relevance == "Minor"]$check <- "potential false positive"
-#crs[relevance != "None"][PurposeName %in% disqualifying.sectors]$check <- "potential false negative"
-crs[relevance != "None"][grepl(paste(disqualifying.keywords, collapse = "|"), tolower(paste(crs[relevance != "None"]$ProjectTitle, crs[relevance != "None"]$ShortDescription, crs[relevance != "None"]$LongDescription))), check := "potential false negative"]
+crs[grepl(paste(major_keywords, collapse = "|"), tolower(paste(ShortDescription, ProjectTitle))), relevance := "Keywords_Major"]
 
 #Remove relevance based on disqualifying factors
-crs[relevance != "None"][grepl(paste(disqualifying.keywords, collapse = "|"), tolower(paste(crs[relevance != "None"]$ProjectTitle, crs[relevance != "None"]$ShortDescription, crs[relevance != "None"]$LongDescription))), relevance := "None"]
-crs[relevance != "None"][PurposeName %in% disqualifying.sectors]$relevance <- "None"
+crs[relevance != "None" & grepl(paste(disqualifying_keywords, collapse = "|"), tolower(paste(ProjectTitle, ShortDescription, LongDescription))), relevance := "Keywords_None"]
+crs[relevance != "None" & PurposeName %in% disqualifying_sectors, relevance := "None"]
 
 #Create Primary DRR identifier based on keyword relevance, DRR marker, and Purpose Name
-crs[, Primary_DRR := ifelse(relevance == "Major" | DRR == 2 | PurposeName == "Disaster Risk Reduction", "Primary", NA_character_)]
+crs[, Primary_DRR := ifelse(relevance == "Keywords_Major" | DRR == 2 | PurposeName == "Disaster Risk Reduction" | (PurposeName == "Multi-hazard response preparedness" & Year < 2018), "DRR", NA_character_)]
 
-#Load in INFORM index Natural Hazard Risk
-inform <- data.table(html_table(read_html(POST('https://drmkc.jrc.ec.europa.eu/Inform-Index/DesktopModules/MVC/InformMVC/Admin/_ResultsTable', config = add_headers(c("content-type"="application/x-www-form-urlencoded; charset=UTF-8","moduleid"="1782","tabid"="1195")), body = "id=433&indicatorsToShow=HA.NAT&countriesToShow=")))[[1]])
-inform <- inform[,.(iso3 = Iso3, IndicatorScore = HA.NAT)]
+#Create CCA identifier based on CCA flag
+crs[ClimateAdaptation == 2, Primary_CCA := "CCA"]
 
-#Merge Countrynames/ISOs
-countrynames <- fread("project_data/isos.csv", encoding = "UTF-8")
-crs <- merge(countrynames[,c("iso3", "countryname_oecd")], crs, by.x = "countryname_oecd", by.y = "RecipientName", all.y = T)
+#Create humanitarian identifier based on sector
+crs[, Humanitarian := ifelse(substr(SectorCode, 1, 1) == "7", "Humanitarian", NA_character_)]
 
-#Merge INFORM index
-crs <- merge(crs, inform[,c("iso3", "IndicatorScore")], by = "iso3", all.x = T)
+#Create localisation identifier based on parent channel
+crs[grepl("^23", ParentChannelCode), Localised := "Localised"]
 
-#Assign Hazard Class based on INFORM
-crs[, hazard_class := ifelse(IndicatorScore >= 6.9, "Very High", ifelse(IndicatorScore >= 4.7, "High", ifelse(IndicatorScore >= 2.8, "Medium", "Low")))]
+drr_comp <- crs[, .(
+                       drr = sum(USD_Disbursement_Defl[Primary_DRR == "DRR" & is.na(Covid_relevance)], na.rm = T)
+                       , cca = sum(USD_Disbursement_Defl[Primary_CCA == "CCA"], na.rm = T)
+                       , hum = sum(USD_Disbursement_Defl[Humanitarian == "Humanitarian"], na.rm = T)
+                       , hum_drr = sum(USD_Disbursement_Defl[Primary_DRR == "DRR" & Humanitarian == "Humanitarian" & is.na(Covid_relevance)], na.rm = T)
+                       , cca_drr = sum(USD_Disbursement_Defl[Primary_DRR == "DRR" & Primary_CCA == "CCA" & is.na(Covid_relevance)], na.rm = T)
+                       , hum_cca = sum(USD_Disbursement_Defl[Primary_CCA == "CCA" & Humanitarian == "Humanitarian"], na.rm = T)
+                       , hum_cca_drr = sum(USD_Disbursement_Defl[Primary_DRR == "DRR" & Primary_CCA == "CCA" & Humanitarian == "Humanitarian" & is.na(Covid_relevance)], na.rm = T)
+                       , all_oda = sum(USD_Disbursement_Defl, na.rm = T)
+), by = .(Year, DonorType, DonorName, DonorISO, RecipientName, RecipientISO, FlowName)]
 
-#Calculate total country DRR and ODA and write
-crs_total <- crs[, .(drr_oda = sum(USD_Disbursement_Defl[Primary_DRR == "Primary"], na.rm = T), total_oda = sum(USD_Disbursement_Defl, na.rm = T)), by = .(Year, iso3, hazard_class, IndicatorScore)]
-fwrite(crs_total, "output/crs_total.csv")
+source("risk_scores.R")
+risk <- fread("risk_scores.csv")
+names(risk)[names(risk) == "iso3"] <- "RecipientISO"
 
-#Write out list of DRR relevant projects
-fwrite(crs[Primary_DRR == "Primary"], "output/all_crs_ddr.csv")
+drr_comp <- merge(drr_comp, risk, by = c("RecipientISO", "Year"), all.x = T)
+
+drr_comp[, inform_class := NA_character_]
+drr_comp[inform < 20, inform_class := "Very low"][inform >= 20, inform_class := "Low"][inform >= 35, inform_class := "Medium"][inform >= 50, inform_class := "High"][inform >= 65, inform_class := "Very high"]
+
+drr_comp[, gain_class := NA_character_]
+drr_comp[gain < 40, gain_class := "Very high"][gain >= 40, gain_class := "High"][gain >= 45, gain_class := "Medium"][gain >= 50, gain_class := "Low"][gain >= 60, gain_class := "Very low"]
+
+fwrite(drr_comp, "DRR_analysis.csv")
+
+crs[, `:=` (keyword = (relevance == "Keywords_Major"), flag = (DRR == 2 & !is.na(DRR)), purposecode = (PurposeName == "Disaster Risk Reduction" | (PurposeName == "Multi-hazard response preparedness" & Year < 2018)))]
+drr_id_method <- crs[is.na(Covid_relevance) & Primary_DRR == "DRR", .(drr = sum(USD_Disbursement_Defl, na.rm = T)), by = .(Year, keyword, flag, purposecode, FlowName)][order(Year, FlowName, keyword, flag, purposecode)]
+
+fwrite(drr_id_method, "DRR_idmethod.csv")
